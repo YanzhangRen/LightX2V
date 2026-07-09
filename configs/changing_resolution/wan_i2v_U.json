@@ -9,7 +9,7 @@
     "sample_guide_scale": 5,
     "sample_shift": 3,
     "enable_cfg": true,
-    "cpu_offload": false,
+    "cpu_offload": true,
     "changing_resolution": true,
     "resolution_rate": [
         1.0,

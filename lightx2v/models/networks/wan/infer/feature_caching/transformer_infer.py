@@ -30,6 +30,7 @@ class WanTransformerInferTeaCaching(WanTransformerInferCaching):
         super().__init__(config)
         self.teacache_thresh = config["teacache_thresh"]
         self.cache_target = config.get("teacache_cache_target", "hidden")
+        self.decision_source = config.get("teacache_decision_source", "auto")
         self.accumulated_rel_l1_distance_even = 0
         self.previous_e0_even = None
         self.previous_residual_even = None
@@ -66,6 +67,21 @@ class WanTransformerInferTeaCaching(WanTransformerInferCaching):
             "mib": round(self._tensor_nbytes(tensor) / (1024 * 1024), 4),
         }
 
+    def _select_decision_tensor(self, embed, embed0):
+        decision_source = self.decision_source
+        if decision_source == "auto":
+            return embed0 if self.use_ret_steps else embed
+        if decision_source == "embed0-full":
+            return embed0
+        if decision_source == "embed-full":
+            return embed
+        if decision_source.startswith("embed0-block"):
+            block_index = int(decision_source.removeprefix("embed0-block"))
+            if block_index < 0 or block_index >= embed0.shape[0]:
+                raise ValueError(f"Invalid TeaCache decision block index {block_index} for embed0 shape {list(embed0.shape)}")
+            return embed0[block_index].contiguous()
+        raise ValueError(f"Unsupported teacache_decision_source: {decision_source}")
+
     def _expand_cached_residual(self, cached_residual, target_hidden_dim):
         if cached_residual.shape[-1] == target_hidden_dim:
             return cached_residual
@@ -89,11 +105,13 @@ class WanTransformerInferTeaCaching(WanTransformerInferCaching):
             return
         grid_t, grid_h, grid_w = pre_infer_out.grid_sizes.tuple
         patch_t, patch_h, patch_w = tuple(self.config.get("patch_size", (1, 2, 2)))
+        decision_tensor = self._select_decision_tensor(pre_infer_out.embed, pre_infer_out.embed0)
         latent_shape = [self.config.get("out_dim", 16), grid_t * patch_t, grid_h * patch_h, grid_w * patch_w]
         latent_numel = math.prod(latent_shape)
         latent_bytes = latent_numel * residual_before_store.element_size()
         payload = {
             "feature_caching": self.config.get("feature_caching"),
+            "decision_source": self.decision_source,
             "note": "TeaCache stores transformer hidden residuals, not the final 16-channel latent tensor.",
             "latent_after_unpatchify": {
                 "shape": latent_shape,
@@ -102,6 +120,7 @@ class WanTransformerInferTeaCaching(WanTransformerInferCaching):
                 "bytes": latent_bytes,
                 "mib": round(latent_bytes / (1024 * 1024), 4),
             },
+            "decision_tensor": self._tensor_summary("decision_tensor", decision_tensor),
             "cached_hidden_residual_before_store": self._tensor_summary("previous_residual", residual_before_store),
             "cached_hidden_residual_after_store": self._tensor_summary("previous_residual_stored", residual_after_store),
             "cached_timestep_embedding": self._tensor_summary("previous_e0", pre_infer_out.embed0),
@@ -116,9 +135,12 @@ class WanTransformerInferTeaCaching(WanTransformerInferCaching):
             return
         grid_t, grid_h, grid_w = pre_infer_out.grid_sizes.tuple
         patch_t, patch_h, patch_w = tuple(self.config.get("patch_size", (1, 2, 2)))
+        decision_tensor = self._select_decision_tensor(pre_infer_out.embed, pre_infer_out.embed0)
         payload = {
             "feature_caching": self.config.get("feature_caching"),
+            "decision_source": self.decision_source,
             "note": "TeaCache stores post_infer 16-channel latent output instead of transformer hidden residual.",
+            "decision_tensor": self._tensor_summary("decision_tensor", decision_tensor),
             "cached_output_latent": self._tensor_summary("output_latent", output_latent),
             "cached_timestep_embedding": self._tensor_summary("previous_e0", pre_infer_out.embed0),
             "grid_sizes": [grid_t, grid_h, grid_w],
@@ -159,7 +181,7 @@ class WanTransformerInferTeaCaching(WanTransformerInferCaching):
     @torch.no_grad()
     def calculate_should_calc(self, embed, embed0):
         # 1. timestep embedding
-        modulated_inp = embed0 if self.use_ret_steps else embed
+        modulated_inp = self._select_decision_tensor(embed, embed0)
 
         # 2. L1 calculate
         should_calc = False

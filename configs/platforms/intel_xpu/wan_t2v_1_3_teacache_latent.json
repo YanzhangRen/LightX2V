@@ -37,6 +37,7 @@
     ],
     "use_ret_steps": true,
     "teacache_cache_target": "latent",
+    "teacache_decision_source": "embed0-full",
     "teacache_thresh": 0.26,
     "teacache_log_cache_stats": true
 }
