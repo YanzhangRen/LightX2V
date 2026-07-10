@@ -625,17 +625,50 @@ class QwenImageScheduler(BaseScheduler):
         self.changing_resolution_index += 1
         target_shape = self.changing_resolution_shapes[self.changing_resolution_index]
 
-        self.latents = self._resize_packed_latents(
-            self.latents,
+        if self.config.get("changing_resolution_resize_noisy_latents", False):
+            self.latents = self._resize_packed_latents(
+                self.latents,
+                source_shape[-2],
+                source_shape[-1],
+                target_shape[-2],
+                target_shape[-1],
+            )
+        else:
+            self._switch_to_next_resolution_with_renoise(source_shape, target_shape)
+        self._apply_current_resolution_to_input_info()
+        self.latent_image_ids = self._prepare_latent_image_ids(1, target_shape[-2] // 2, target_shape[-1] // 2, AI_DEVICE, self.dtype)
+        self._refresh_resolution_conditioning(self.input_info)
+        logger.info(f"Qwen changing_resolution switched to latent shape {target_shape[-2:]}")
+
+    def _switch_to_next_resolution_with_renoise(self, source_shape, target_shape):
+        model_output = self.noise_pred.to(torch.float32)
+        sample = self.latents.to(torch.float32)
+        sigma_t = self.scheduler.sigmas[self.step_index].to(device=sample.device, dtype=sample.dtype)
+        denoised_sample = sample - sigma_t * model_output
+
+        denoised_sample = self._resize_packed_latents(
+            denoised_sample.to(self.dtype),
             source_shape[-2],
             source_shape[-1],
             target_shape[-2],
             target_shape[-1],
         )
-        self._apply_current_resolution_to_input_info()
-        self.latent_image_ids = self._prepare_latent_image_ids(1, target_shape[-2] // 2, target_shape[-1] // 2, AI_DEVICE, self.dtype)
-        self._refresh_resolution_conditioning(self.input_info)
-        logger.info(f"Qwen changing_resolution switched to latent shape {target_shape[-2:]}")
+
+        target_noise_shape = (
+            target_shape[0],
+            target_shape[1],
+            target_shape[2],
+            target_shape[3],
+            target_shape[4],
+        )
+        target_noise = self._prepare_latents_lightx2v(
+            target_noise_shape,
+            target_shape[-2],
+            target_shape[-1],
+            denoised_sample.shape[-1] // 4,
+        )
+        next_sigma = self.scheduler.sigmas[self.step_index + 1].to(device=denoised_sample.device, dtype=denoised_sample.dtype)
+        self.latents = (1.0 - next_sigma) * denoised_sample + next_sigma * target_noise
 
     def _get_i2i_denoise_strength(self, input_info):
         strength = getattr(input_info, "i2i_denoise_strength", None)
@@ -730,6 +763,16 @@ class QwenImageScheduler(BaseScheduler):
         self.latent_image_ids = latent_image_ids
         self.noise_pred = None
 
+    def _get_timestep_image_seq_len(self):
+        if self.changing_resolution_enabled and self.config.get("changing_resolution_timestep_base", "final") == "final":
+            final_shape = getattr(self, "final_target_shape", None)
+            if final_shape is not None:
+                return (final_shape[-2] // 2) * (final_shape[-1] // 2)
+        image_seq_len = self.latents.shape[1]
+        if self.is_layered:
+            image_seq_len = self.latents.shape[1] // 5
+        return image_seq_len
+
     def set_timesteps(self):
         num_inference_steps = self.config["infer_steps"]
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
@@ -749,10 +792,9 @@ class QwenImageScheduler(BaseScheduler):
             timesteps = self.scheduler.timesteps
         else:
             # Original: resolution-adaptive exponential shift via diffusers.
-            image_seq_len = self.latents.shape[1]
+            image_seq_len = self._get_timestep_image_seq_len()
             if self.is_layered:
                 base_seqlen = 256 * 256 / 16 / 16
-                image_seq_len = self.latents.shape[1] // 5
                 mu = (image_seq_len / base_seqlen) ** 0.5
             else:
                 mu = calculate_shift(
@@ -810,7 +852,13 @@ class QwenImageScheduler(BaseScheduler):
     def step_post(self):
         # compute the previous noisy sample x_t -> x_t-1
         t = self.timesteps[self.step_index]
+        if self.changing_resolution_enabled and self.step_index + 1 in self.config["changing_resolution_steps"]:
+            if self.config.get("changing_resolution_resize_noisy_latents", False):
+                latents = self.scheduler.step(self.noise_pred, t, self.latents, return_dict=False)[0]
+                self.latents = latents
+            else:
+                self.scheduler.step(self.noise_pred, t, self.latents, return_dict=False)
+            self._switch_to_next_resolution()
+            return
         latents = self.scheduler.step(self.noise_pred, t, self.latents, return_dict=False)[0]
         self.latents = latents
-        if self.changing_resolution_enabled and self.step_index + 1 in self.config["changing_resolution_steps"]:
-            self._switch_to_next_resolution()

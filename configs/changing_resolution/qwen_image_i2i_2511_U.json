@@ -19,12 +19,11 @@
     "CONDITION_IMAGE_SIZE": 147456,
     "USE_IMAGE_ID_IN_PROMPT": true,
     "changing_resolution": true,
+    "changing_resolution_timestep_base": "final",
     "resolution_rate": [
-        1.0,
         0.75
     ],
     "changing_resolution_steps": [
-        5,
-        30
+        20
     ]
 }
