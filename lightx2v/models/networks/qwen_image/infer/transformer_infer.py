@@ -7,11 +7,16 @@ from loguru import logger
 from lightx2v.common.magi_custom_op_mode import configure_dynamo_for_magi_compile, set_magi_custom_op_mode
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 
-from .triton_ops import (
-    fuse_scale_shift_gate_select01_kernel,
-    fuse_scale_shift_kernel,
-)
 from .utils import apply_qwen_rope_with_flashinfer, apply_qwen_rope_with_torch, apply_qwen_rope_with_torch_naive
+
+try:
+    from .triton_ops import (
+        fuse_scale_shift_gate_select01_kernel,
+        fuse_scale_shift_kernel,
+    )
+except ImportError:
+    fuse_scale_shift_gate_select01_kernel = None
+    fuse_scale_shift_kernel = None
 
 try:
     from magi_compiler import magi_compile
@@ -48,7 +53,12 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
             self.seq_p_fp4_comm = False
             self.enable_head_parallel = False
         if self.config.get("modulate_type", "triton") == "triton":
-            self.modulate_func = fuse_scale_shift_kernel
+            if fuse_scale_shift_kernel is None or fuse_scale_shift_gate_select01_kernel is None:
+                logger.warning("QwenImage Triton modulation is unavailable; falling back to torch modulation.")
+                self.config["modulate_type"] = "torch"
+                self.modulate_func = lambda x, scale, shift: x * (1 + scale) + shift
+            else:
+                self.modulate_func = fuse_scale_shift_kernel
         else:
             self.modulate_func = lambda x, scale, shift: x * (1 + scale) + shift
         rope_funcs = {

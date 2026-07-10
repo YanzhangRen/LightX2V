@@ -38,7 +38,7 @@ class AutoencoderKLQwenImageVAE:
 
     def load(self):
         vae_path = self.config.get("vae_path", os.path.join(self.config["model_path"], "vae"))
-        self.model = AutoencoderKLQwenImage.from_pretrained(vae_path).to(self.device).to(self.dtype)
+        self.model = AutoencoderKLQwenImage.from_pretrained(vae_path, torch_dtype=self.dtype).to(self.device)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.config["vae_scale_factor"] * 2)
         if self.config.get("use_tiling_vae", False):
             self.model.enable_tiling()

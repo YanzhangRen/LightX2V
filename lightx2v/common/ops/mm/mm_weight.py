@@ -1,3 +1,5 @@
+import json
+import os
 import re
 from abc import ABCMeta, abstractmethod
 
@@ -131,6 +133,24 @@ try:
     import sycl_kernels
 except ImportError:
     sycl_kernels = None
+
+
+def _decode_bnb_quant_state(quant_state_tensor):
+    state_json = bytes(quant_state_tensor.detach().cpu().flatten().tolist()).decode("utf-8")
+    return json.loads(state_json)
+
+
+def _dequantize_bnb_nf4(packed_weight, absmax, quant_map, quant_shape, blocksize, out_dtype):
+    packed = packed_weight.reshape(-1)
+    pair_map = torch.empty((256, 2), dtype=torch.float32, device=packed.device)
+    byte_values = torch.arange(256, dtype=torch.long, device=packed.device)
+    pair_map[:, 0] = quant_map[(byte_values >> 4) & 0x0F].to(torch.float32)
+    pair_map[:, 1] = quant_map[byte_values & 0x0F].to(torch.float32)
+
+    values = pair_map[packed.to(torch.long)].reshape(-1)
+    values = values[: int(torch.tensor(quant_shape).prod().item())]
+    values = values.reshape(-1, blocksize) * absmax.reshape(-1, 1).to(torch.float32)
+    return values.reshape(quant_shape).to(out_dtype)
 
 
 class MMWeightTemplate(metaclass=ABCMeta):
@@ -373,6 +393,106 @@ class MMWeight(MMWeightTemplate):
                 bias_tensor = lazy_load_file.get_tensor(self.bias_name)
                 self.pin_bias.copy_(bias_tensor)
                 del bias_tensor
+
+
+@MM_WEIGHT_REGISTER("bnb-nf4")
+class MMWeightBnbNF4(MMWeightTemplate):
+    def __init__(
+        self,
+        weight_name,
+        bias_name=None,
+        create_cuda_buffer=False,
+        create_cpu_buffer=False,
+        lazy_load=False,
+        lazy_load_file=None,
+        is_post_adapter=False,
+        lora_prefix="diffusion_model.blocks",
+        lora_path="",
+    ):
+        super().__init__(
+            weight_name,
+            bias_name,
+            create_cuda_buffer,
+            create_cpu_buffer,
+            lazy_load,
+            lazy_load_file,
+            is_post_adapter,
+            lora_prefix,
+            lora_path,
+        )
+        self.weight_absmax_name = f"{self.weight_name}.absmax"
+        self.weight_quant_map_name = f"{self.weight_name}.quant_map"
+        self.weight_quant_state_name = f"{self.weight_name}.quant_state.bitsandbytes__nf4"
+        self.base_attrs = [
+            (self.weight_name, "weight", False),
+            (self.weight_absmax_name, "weight_absmax", False),
+            (self.weight_quant_map_name, "weight_quant_map", False),
+            (self.weight_quant_state_name, "weight_quant_state", False),
+        ]
+        if self.bias_name is not None:
+            self.base_attrs.append((self.bias_name, "bias", False))
+        self.quant_shape = None
+        self.blocksize = 64
+
+    def _set_quant_state(self, weight_dict):
+        if self.weight_quant_state_name not in weight_dict:
+            raise KeyError(f"Missing bitsandbytes NF4 quant state: {self.weight_quant_state_name}")
+        quant_state = _decode_bnb_quant_state(weight_dict[self.weight_quant_state_name])
+        if quant_state.get("quant_type") != "nf4":
+            raise ValueError(f"Unsupported bitsandbytes quant_type for {self.weight_name}: {quant_state.get('quant_type')}")
+        self.quant_shape = tuple(quant_state["shape"])
+        self.blocksize = int(quant_state.get("blocksize", 64))
+
+    def load(self, weight_dict):
+        self._set_quant_state(weight_dict)
+        if not self.create_cuda_buffer and not self.create_cpu_buffer and not self.lazy_load:
+            device_tensors, pin_tensors = create_default_tensors(self.base_attrs, weight_dict)
+            self.weight = device_tensors.get("weight")
+            self.weight_absmax = device_tensors.get("weight_absmax")
+            self.weight_quant_map = device_tensors.get("weight_quant_map")
+            self.weight_quant_state = device_tensors.get("weight_quant_state")
+            self.bias = device_tensors.get("bias")
+            self.pin_weight = pin_tensors.get("weight")
+            self.pin_weight_absmax = pin_tensors.get("weight_absmax")
+            self.pin_weight_quant_map = pin_tensors.get("weight_quant_map")
+            self.pin_weight_quant_state = pin_tensors.get("weight_quant_state")
+            self.pin_bias = pin_tensors.get("bias")
+        elif self.create_cuda_buffer:
+            result = create_cuda_buffers(self.base_attrs, weight_dict, self.lazy_load, self.lazy_load_file, scale_force_fp32=True)
+            self.weight_cuda_buffer = result.get("weight")
+            self.weight_absmax_cuda_buffer = result.get("weight_absmax")
+            self.weight_quant_map_cuda_buffer = result.get("weight_quant_map")
+            self.weight_quant_state_cuda_buffer = result.get("weight_quant_state")
+            self.bias_cuda_buffer = result.get("bias")
+        elif self.create_cpu_buffer:
+            result = create_cpu_buffers(self.base_attrs, self.lazy_load_file, scale_force_fp32=True)
+            self.pin_weight = result.get("weight")
+            self.pin_weight_absmax = result.get("weight_absmax")
+            self.pin_weight_quant_map = result.get("weight_quant_map")
+            self.pin_weight_quant_state = result.get("weight_quant_state")
+            self.pin_bias = result.get("bias")
+            self.weight = None
+            self.weight_absmax = None
+            self.weight_quant_map = None
+            self.weight_quant_state = None
+            self.bias = None
+
+    def apply(self, input_tensor):
+        weight = _dequantize_bnb_nf4(
+            self.weight,
+            self.weight_absmax,
+            self.weight_quant_map,
+            self.quant_shape,
+            self.blocksize,
+            input_tensor.dtype,
+        ).t()
+        bias = self._get_actual_bias()
+        if bias is not None and bias.dtype != input_tensor.dtype:
+            bias = bias.to(input_tensor.dtype)
+        output_tensor = torch.addmm(bias, input_tensor, weight) if bias is not None else torch.mm(input_tensor, weight)
+        if self.has_lora_branch:
+            output_tensor = output_tensor + self.apply_lora(input_tensor)
+        return output_tensor
 
 
 @MM_WEIGHT_REGISTER("Default-ForceFp32")

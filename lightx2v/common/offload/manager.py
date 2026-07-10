@@ -21,6 +21,9 @@ class WeightAsyncStreamManager(object):
         if AI_DEVICE == "cuda" and torch_version >= parse("2.7"):
             self.cuda_load_stream = torch_device_module.Stream(priority=1)
             self.compute_stream = torch_device_module.Stream(priority=1)
+        elif AI_DEVICE == "xpu":
+            self.cuda_load_stream = torch_device_module.current_stream()
+            self.compute_stream = torch_device_module.current_stream()
         else:
             self.cuda_load_stream = torch_device_module.Stream(priority=0)
             self.compute_stream = torch_device_module.Stream(priority=-1)

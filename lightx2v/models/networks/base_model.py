@@ -132,6 +132,7 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
             "int8-npu",
             "fp8-intel-xpu",
             "int8-iluvatar",
+            "bnb-nf4",
         ]
 
     @abstractmethod
@@ -509,6 +510,9 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
                 logger.info(f"Loading weights from {safetensor_path}")
                 for k in f.keys():
                     if any(remove_key in k for remove_key in remove_keys):
+                        continue
+                    if self.config.get("dit_quant_scheme", "Default") == "bnb-nf4" and (k.endswith(".absmax") or k.endswith(".quant_map")):
+                        weight_dict[k] = f.get_tensor(k).to(torch.float32).to(self.device)
                         continue
                     if f.get_tensor(k).dtype in [torch.float16, torch.bfloat16, torch.float]:
                         if unified_dtype or all(s not in k for s in sensitive_layer):
