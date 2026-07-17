@@ -87,7 +87,10 @@ class Qwen25_VLForConditionalGeneration_TextEncoder:
                 self.device_map = AI_DEVICE
             self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(self.config["qwen25vl_quantized_ckpt"], dtype=torch.bfloat16, device_map=self.device_map, low_cpu_mem_usage=True)
         else:
-            self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(os.path.join(self.config["model_path"], "text_encoder"), torch_dtype=torch.bfloat16)
+            text_encoder_kwargs = {"torch_dtype": torch.bfloat16}
+            if self.cpu_offload:
+                text_encoder_kwargs.update({"device_map": {"": "cpu"}, "low_cpu_mem_usage": True})
+            self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(os.path.join(self.config["model_path"], "text_encoder"), **text_encoder_kwargs)
 
         if not self.cpu_offload:
             self.text_encoder = self.text_encoder.to(AI_DEVICE)

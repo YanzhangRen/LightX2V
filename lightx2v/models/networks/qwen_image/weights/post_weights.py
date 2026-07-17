@@ -10,10 +10,11 @@ class QwenImagePostWeights(WeightModule):
         super().__init__()
         self.task = config["task"]
         self.config = config
+        mm_type = config.get("dit_quant_scheme", "Default") if config.get("dit_quantized", False) else "Default"
         # norm_out
         self.add_module(
             "norm_out_linear",
-            MM_WEIGHT_REGISTER["Default"](
+            MM_WEIGHT_REGISTER[mm_type](
                 "norm_out.linear.weight",
                 "norm_out.linear.bias",
             ),
@@ -23,7 +24,7 @@ class QwenImagePostWeights(WeightModule):
         # proj_out
         self.add_module(
             "proj_out_linear",
-            MM_WEIGHT_REGISTER["Default"](
+            MM_WEIGHT_REGISTER[mm_type](
                 "proj_out.weight",
                 "proj_out.bias",
             ),

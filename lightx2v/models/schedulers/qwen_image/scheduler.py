@@ -1,3 +1,4 @@
+import copy
 import functools
 import inspect
 import json
@@ -445,6 +446,9 @@ class QwenImageScheduler(BaseScheduler):
             self.pos_embed = QwenEmbedLayer3DRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
         else:
             self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
+        self.changing_resolution_enabled = config.get("changing_resolution", False)
+        if self.changing_resolution_enabled and self.is_layered:
+            raise ValueError("changing_resolution is not supported for layered qwen-image inference.")
 
     @staticmethod
     def _pack_latents(latents, batchsize, num_channels_latents, height, width, layers=None):
@@ -507,6 +511,164 @@ class QwenImageScheduler(BaseScheduler):
         latents = latents.permute(0, 2, 3, 1)  # [B, H//2, W//2, C*4]
         latents = latents.reshape(b, (height // 2) * (width // 2), num_channels_latents * 4)
         return latents
+
+    @staticmethod
+    def _scale_to_even_latent_size(value, rate):
+        return max(2, int(value * rate) // 2 * 2)
+
+    def _make_target_shape(self, base_shape, height, width):
+        target_shape = list(base_shape)
+        target_shape[-2] = height
+        target_shape[-1] = width
+        return tuple(target_shape)
+
+    def _init_changing_resolution_shapes(self, input_info):
+        if not self.changing_resolution_enabled:
+            return
+
+        if "resolution_rate" not in self.config:
+            self.config["resolution_rate"] = [0.75]
+        if "changing_resolution_steps" not in self.config:
+            self.config["changing_resolution_steps"] = [self.config["infer_steps"] // 2]
+        if len(self.config["resolution_rate"]) != len(self.config["changing_resolution_steps"]):
+            raise ValueError("resolution_rate and changing_resolution_steps must have the same length for qwen-image changing_resolution.")
+
+        for step in self.config["changing_resolution_steps"]:
+            if step <= 0 or step >= self.config["infer_steps"]:
+                raise ValueError(f"changing_resolution step must be in [1, infer_steps - 1], got {step} with infer_steps={self.config['infer_steps']}.")
+
+        base_shape = tuple(input_info.target_shape)
+        base_height, base_width = base_shape[-2], base_shape[-1]
+        self.changing_resolution_shapes = [
+            self._make_target_shape(
+                base_shape,
+                self._scale_to_even_latent_size(base_height, rate),
+                self._scale_to_even_latent_size(base_width, rate),
+            )
+            for rate in self.config["resolution_rate"]
+        ]
+        self.changing_resolution_shapes.append(base_shape)
+        self.changing_resolution_index = 0
+        self.final_target_shape = base_shape
+        self.final_auto_height = input_info.auto_height
+        self.final_auto_width = input_info.auto_width
+        self.base_image_shapes = copy.deepcopy(input_info.image_shapes)
+        logger.info(
+            "Qwen changing_resolution enabled: "
+            f"steps={self.config['changing_resolution_steps']}, "
+            f"latent_shapes={[shape[-2:] for shape in self.changing_resolution_shapes]}"
+        )
+
+    def _apply_current_resolution_to_input_info(self):
+        if not self.changing_resolution_enabled:
+            return
+
+        current_shape = self.changing_resolution_shapes[self.changing_resolution_index]
+        current_height, current_width = current_shape[-2], current_shape[-1]
+        self.input_info.target_shape = current_shape
+        self.input_info.auto_height = current_height * self.config["vae_scale_factor"]
+        self.input_info.auto_width = current_width * self.config["vae_scale_factor"]
+
+        image_shapes = copy.deepcopy(self.base_image_shapes)
+        image_shapes[0][0] = (1, current_height // 2, current_width // 2)
+        self.input_info.image_shapes = image_shapes
+
+    def _prepare_qwen_rope(self, image_shapes, txt_seq_len):
+        image_rotary_emb = self.pos_embed(image_shapes, txt_seq_len, device=AI_DEVICE)
+        if self.config.get("rope_type", "flashinfer") == "flashinfer":
+            cos_half_img = image_rotary_emb[0].real.contiguous()
+            sin_half_img = image_rotary_emb[0].imag.contiguous()
+            cos_half_txt = image_rotary_emb[1].real.contiguous()
+            sin_half_txt = image_rotary_emb[1].imag.contiguous()
+            image_rotary_emb[0] = torch.cat([cos_half_img, sin_half_img], dim=-1)
+            image_rotary_emb[1] = torch.cat([cos_half_txt, sin_half_txt], dim=-1)
+        if self.seq_p_group is not None:
+            world_size = dist.get_world_size(self.seq_p_group)
+            cur_rank = dist.get_rank(self.seq_p_group)
+            seqlen = image_rotary_emb[0].shape[0]
+            padding_size = (world_size - (seqlen % world_size)) % world_size
+            if padding_size > 0:
+                image_rotary_emb[0] = F.pad(image_rotary_emb[0], (0, 0, 0, padding_size))
+            image_rotary_emb[0] = torch.chunk(image_rotary_emb[0], world_size, dim=0)[cur_rank]
+        return image_rotary_emb
+
+    def _refresh_resolution_conditioning(self, input_info):
+        self.image_rotary_emb = self._prepare_qwen_rope(self.input_info.image_shapes, input_info.txt_seq_lens[0])
+
+        if self.config["enable_cfg"]:
+            self.negative_image_rotary_emb = self._prepare_qwen_rope(self.input_info.image_shapes, input_info.txt_seq_lens[1])
+
+        if self.zero_cond_t:
+            self.modulate_index = torch.tensor([[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in self.input_info.image_shapes], device=AI_DEVICE, dtype=torch.int)
+            if self.seq_p_group is not None:
+                world_size = dist.get_world_size(self.seq_p_group)
+                cur_rank = dist.get_rank(self.seq_p_group)
+                seqlen = self.modulate_index.shape[1]
+                padding_size = (world_size - (seqlen % world_size)) % world_size
+                if padding_size > 0:
+                    self.modulate_index = F.pad(self.modulate_index, (0, padding_size))
+                self.modulate_index = torch.chunk(self.modulate_index, world_size, dim=1)[cur_rank]
+        else:
+            self.modulate_index = None
+
+    def _resize_packed_latents(self, latents, source_height, source_width, target_height, target_width):
+        num_channels_latents = latents.shape[-1] // 4
+        latents = self._unpack_packed_latents_to_4d(latents, source_height, source_width)
+        latents = F.interpolate(latents, size=(target_height, target_width), mode="bilinear", align_corners=False)
+        return self._pack_latents(latents, latents.shape[0], num_channels_latents, target_height, target_width)
+
+    def _switch_to_next_resolution(self):
+        if not self.changing_resolution_enabled:
+            return
+
+        source_shape = self.changing_resolution_shapes[self.changing_resolution_index]
+        self.changing_resolution_index += 1
+        target_shape = self.changing_resolution_shapes[self.changing_resolution_index]
+
+        if self.config.get("changing_resolution_resize_noisy_latents", False):
+            self.latents = self._resize_packed_latents(
+                self.latents,
+                source_shape[-2],
+                source_shape[-1],
+                target_shape[-2],
+                target_shape[-1],
+            )
+        else:
+            self._switch_to_next_resolution_with_renoise(source_shape, target_shape)
+        self._apply_current_resolution_to_input_info()
+        self.latent_image_ids = self._prepare_latent_image_ids(1, target_shape[-2] // 2, target_shape[-1] // 2, AI_DEVICE, self.dtype)
+        self._refresh_resolution_conditioning(self.input_info)
+        logger.info(f"Qwen changing_resolution switched to latent shape {target_shape[-2:]}")
+
+    def _switch_to_next_resolution_with_renoise(self, source_shape, target_shape):
+        model_output = self.noise_pred.to(torch.float32)
+        sample = self.latents.to(torch.float32)
+        sigma_t = self.scheduler.sigmas[self.step_index].to(device=sample.device, dtype=sample.dtype)
+        denoised_sample = sample - sigma_t * model_output
+
+        denoised_sample = self._resize_packed_latents(
+            denoised_sample.to(self.dtype),
+            source_shape[-2],
+            source_shape[-1],
+            target_shape[-2],
+            target_shape[-1],
+        )
+
+        target_noise_shape = (
+            target_shape[0],
+            target_shape[1],
+            target_shape[2],
+            target_shape[3],
+            target_shape[4],
+        )
+        target_noise = self._prepare_latents_lightx2v(
+            target_noise_shape,
+            target_shape[-2],
+            target_shape[-1],
+            denoised_sample.shape[-1] // 4,
+        )
+        next_sigma = self.scheduler.sigmas[self.step_index + 1].to(device=denoised_sample.device, dtype=denoised_sample.dtype)
+        self.latents = (1.0 - next_sigma) * denoised_sample + next_sigma * target_noise
 
     def _get_i2i_denoise_strength(self, input_info):
         strength = getattr(input_info, "i2i_denoise_strength", None)
@@ -583,7 +745,10 @@ class QwenImageScheduler(BaseScheduler):
 
     def prepare_latents(self, input_info):
         self.input_info = input_info
-        shape = input_info.target_shape
+        self._init_changing_resolution_shapes(input_info)
+        if self.changing_resolution_enabled:
+            self._apply_current_resolution_to_input_info()
+        shape = self.input_info.target_shape
         # shape: [B, T, C, H, W]
         width, height = shape[-1], shape[-2]
         num_channels_latents = self.config.get("num_channels_latents", 16)
@@ -597,6 +762,16 @@ class QwenImageScheduler(BaseScheduler):
         self.latents = latents
         self.latent_image_ids = latent_image_ids
         self.noise_pred = None
+
+    def _get_timestep_image_seq_len(self):
+        if self.changing_resolution_enabled and self.config.get("changing_resolution_timestep_base", "final") == "final":
+            final_shape = getattr(self, "final_target_shape", None)
+            if final_shape is not None:
+                return (final_shape[-2] // 2) * (final_shape[-1] // 2)
+        image_seq_len = self.latents.shape[1]
+        if self.is_layered:
+            image_seq_len = self.latents.shape[1] // 5
+        return image_seq_len
 
     def set_timesteps(self):
         num_inference_steps = self.config["infer_steps"]
@@ -617,10 +792,9 @@ class QwenImageScheduler(BaseScheduler):
             timesteps = self.scheduler.timesteps
         else:
             # Original: resolution-adaptive exponential shift via diffusers.
-            image_seq_len = self.latents.shape[1]
+            image_seq_len = self._get_timestep_image_seq_len()
             if self.is_layered:
                 base_seqlen = 256 * 256 / 16 / 16
-                image_seq_len = self.latents.shape[1] // 5
                 mu = (image_seq_len / base_seqlen) ** 0.5
             else:
                 mu = calculate_shift(
@@ -666,53 +840,7 @@ class QwenImageScheduler(BaseScheduler):
         if self.config["task"] == "i2i" and strength is not None:
             self.prepare_i2i_denoise_strength_latents(input_info)
 
-        self.image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[0], device=AI_DEVICE)
-        if self.config.get("rope_type", "flashinfer") == "flashinfer":
-            cos_half_img = self.image_rotary_emb[0].real.contiguous()
-            sin_half_img = self.image_rotary_emb[0].imag.contiguous()
-            cos_half_txt = self.image_rotary_emb[1].real.contiguous()
-            sin_half_txt = self.image_rotary_emb[1].imag.contiguous()
-            self.image_rotary_emb[0] = torch.cat([cos_half_img, sin_half_img], dim=-1)
-            self.image_rotary_emb[1] = torch.cat([cos_half_txt, sin_half_txt], dim=-1)
-        if self.seq_p_group is not None:
-            world_size = dist.get_world_size(self.seq_p_group)
-            cur_rank = dist.get_rank(self.seq_p_group)
-            seqlen = self.image_rotary_emb[0].shape[0]
-            padding_size = (world_size - (seqlen % world_size)) % world_size
-            if padding_size > 0:
-                self.image_rotary_emb[0] = F.pad(self.image_rotary_emb[0], (0, 0, 0, padding_size))
-            self.image_rotary_emb[0] = torch.chunk(self.image_rotary_emb[0], world_size, dim=0)[cur_rank]
-
-        if self.config["enable_cfg"]:
-            self.negative_image_rotary_emb = self.pos_embed(self.input_info.image_shapes, input_info.txt_seq_lens[1], device=AI_DEVICE)
-            if self.config.get("rope_type", "flashinfer") == "flashinfer":
-                cos_half_img = self.negative_image_rotary_emb[0].real.contiguous()
-                sin_half_img = self.negative_image_rotary_emb[0].imag.contiguous()
-                cos_half_txt = self.negative_image_rotary_emb[1].real.contiguous()
-                sin_half_txt = self.negative_image_rotary_emb[1].imag.contiguous()
-                self.negative_image_rotary_emb[0] = torch.cat([cos_half_img, sin_half_img], dim=-1)
-                self.negative_image_rotary_emb[1] = torch.cat([cos_half_txt, sin_half_txt], dim=-1)
-            if self.seq_p_group is not None:
-                world_size = dist.get_world_size(self.seq_p_group)
-                cur_rank = dist.get_rank(self.seq_p_group)
-                seqlen = self.negative_image_rotary_emb[0].shape[0]
-                padding_size = (world_size - (seqlen % world_size)) % world_size
-                if padding_size > 0:
-                    self.negative_image_rotary_emb[0] = F.pad(self.negative_image_rotary_emb[0], (0, 0, 0, padding_size))
-                self.negative_image_rotary_emb[0] = torch.chunk(self.negative_image_rotary_emb[0], world_size, dim=0)[cur_rank]
-
-        if self.zero_cond_t:
-            self.modulate_index = torch.tensor([[0] * prod(sample[0]) + [1] * sum([prod(s) for s in sample[1:]]) for sample in self.input_info.image_shapes], device=AI_DEVICE, dtype=torch.int)
-            if self.seq_p_group is not None:
-                world_size = dist.get_world_size(self.seq_p_group)
-                cur_rank = dist.get_rank(self.seq_p_group)
-                seqlen = self.modulate_index.shape[1]
-                padding_size = (world_size - (seqlen % world_size)) % world_size
-                if padding_size > 0:
-                    self.modulate_index = F.pad(self.modulate_index, (0, padding_size))
-                self.modulate_index = torch.chunk(self.modulate_index, world_size, dim=1)[cur_rank]
-        else:
-            self.modulate_index = None
+        self._refresh_resolution_conditioning(input_info)
 
     def step_pre(self, step_index):
         super().step_pre(step_index)
@@ -724,5 +852,13 @@ class QwenImageScheduler(BaseScheduler):
     def step_post(self):
         # compute the previous noisy sample x_t -> x_t-1
         t = self.timesteps[self.step_index]
+        if self.changing_resolution_enabled and self.step_index + 1 in self.config["changing_resolution_steps"]:
+            if self.config.get("changing_resolution_resize_noisy_latents", False):
+                latents = self.scheduler.step(self.noise_pred, t, self.latents, return_dict=False)[0]
+                self.latents = latents
+            else:
+                self.scheduler.step(self.noise_pred, t, self.latents, return_dict=False)
+            self._switch_to_next_resolution()
+            return
         latents = self.scheduler.step(self.noise_pred, t, self.latents, return_dict=False)[0]
         self.latents = latents

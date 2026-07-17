@@ -17,11 +17,13 @@
     "rms_norm_type": "torch",
     "changing_resolution": true,
     "resolution_rate": [
-        1.0,
-        0.75
+        0.5,
+        0.75,
+        0.9
     ],
     "changing_resolution_steps": [
         10,
-        35
+        20,
+        30
     ]
 }
