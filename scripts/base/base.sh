@@ -10,7 +10,18 @@ if [ -z "${model_path}" ]; then
     exit 1
 fi
 
-export PYTHONPATH=${lightx2v_path}:$PYTHONPATH
+# Windows Python uses ';' as PYTHONPATH separator even when launched from sh/Git Bash.
+if [ "${OS}" = "Windows_NT" ] || [ -n "${MSYSTEM}" ] || [ -n "${MINGW_PREFIX}" ]; then
+    py_path_sep=";"
+else
+    py_path_sep=":"
+fi
+
+if [ -n "${PYTHONPATH}" ]; then
+    export PYTHONPATH="${lightx2v_path}${py_path_sep}${PYTHONPATH}"
+else
+    export PYTHONPATH="${lightx2v_path}"
+fi
 
 export MOONCAKE_CONFIG_PATH=${lightx2v_path}/configs/mooncake_config.json
 
